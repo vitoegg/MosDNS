@@ -1,0 +1,22 @@
+--- a/luci-app-mosdns/root/usr/share/mosdns/mosdns.uc
++++ b/luci-app-mosdns/root/usr/share/mosdns/mosdns.uc
+@@ -329,9 +329,7 @@
+ 		}
+ 		writefile('/var/lock/mosdns_update.lock', '');
+ 		try {
+-			update_geodat();
+ 			update_adlist();
+-			v2dat_dump();
+ 			print("UPDATE_FINISHED\n");
+ 			stdout.flush();
+ 		} catch (e) {
+@@ -346,9 +344,6 @@
+ 	case "update_adlist":
+ 		update_adlist();
+ 		break;
+-	case "v2dat_dump":
+-		v2dat_dump();
+-		break;
+ 	default:
+ 		exit(0);
+ }

@@ -1,0 +1,51 @@
+--- a/luci-app-mosdns/root/etc/init.d/mosdns
++++ b/luci-app-mosdns/root/etc/init.d/mosdns
+@@ -2,15 +2,14 @@
+ # Copyright (C) 2020-2022, IrineSistiana
+ # Copyright (C) 2023-2026, sbwml <admin@cooluc.com>
+ 
+ START=75
+ USE_PROCD=1
+ 
+ PROG=/usr/bin/mosdns
+-CONF=$(uci -q get mosdns.config.configfile)
+ CRON_FILE=/etc/crontabs/root
+ DUMP_FILE=/etc/mosdns/cache.dump
+ DUMP_FILE_DEFAULT=/usr/share/mosdns/cache.dump
+ MOSDNS_SCRIPT=/usr/share/mosdns/mosdns.uc
+ REDIRECT_LOCK_FILE=/etc/mosdns/redirect.lock
+ 
+ get_config() {
+@@ -48,14 +47,15 @@ get_config() {
+ 	config_get idle_timeout $1 idle_timeout 30
+ 	config_get enable_ecs_remote $1 enable_ecs_remote 0
+ 	config_get remote_ecs_ip $1 remote_ecs_ip "110.34.181.1"
+ 	config_get dns_leak $1 dns_leak 0
+ 	config_get cloudflare $1 cloudflare 0
+ 	config_get cloudflare_ip $1 cloudflare_ip ""
+ 	config_get reject_type65 $1 reject_type65 "0"
++	config_get CONF $1 configfile "/var/etc/mosdns.json"
+ }
+ 
+ generate_config() {
+ 	# jshn shell library
+ 	. /usr/share/libubox/jshn.sh
+ 	# json data
+ 	json_init
+@@ -773,16 +773,14 @@ start_service() {
+ 	config_load "mosdns"
+ 	config_foreach get_config "mosdns"
+ 	[ $enabled -ne 1 ] && return 1
+ 	delcron ; setcron
+ 
+ 	rm -rf /tmp/log/mosdns*
+ 
+-	$MOSDNS_SCRIPT v2dat_dump
+-
+ 	[ "${CONF}" = "/var/etc/mosdns.json" ] && generate_config
+ 
+ 	procd_open_instance mosdns
+ 	procd_set_param env QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING=true
+ 	procd_set_param command $PROG start
+ 	procd_append_param command -c "$CONF"
+ 	procd_append_param command -d "/etc/mosdns"

@@ -1,0 +1,154 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: openmosdns-master-writes
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: sbwml/luci-app-mosdns
+  UPSTREAM_REF: v5
+  TARGET_BRANCH: master
+
+jobs:
+  sync:
+    name: Sync upstream and apply customizations
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream and apply customizations
+        id: sync
+        run: |
+          set -eu
+          . maint/scripts/workflow-writeback.sh
+          workflow_writeback_config_git
+
+          temp_dir="$(mktemp -d)"
+          upstream_dir="$temp_dir/upstream"
+          apply_log="$temp_dir/apply.log"
+          commit_message="$temp_dir/commit-message.txt"
+          customization_status="success"
+          commit_sha=""
+
+          cleanup() {
+            rm -rf "$temp_dir"
+          }
+
+          trap cleanup EXIT
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_REF}"
+
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_REF}")"
+          echo "upstream_sha=${upstream_sha}" >> "${GITHUB_OUTPUT}"
+
+          mkdir -p "$upstream_dir"
+          git archive "upstream/${UPSTREAM_REF}" | tar -x -C "$upstream_dir"
+
+          short_upstream_sha="$(printf '%s' "${upstream_sha}" | cut -c1-7)"
+          printf 'sync: upstream %s\n' "$short_upstream_sha" > "$commit_message"
+
+          previous_upstream_ref="$(
+            git log --first-parent --format='%s' |
+              sed -n 's/^sync: upstream \([0-9a-f]\{7\}\)$/\1/p' |
+              head -n 1
+          )"
+          if [ -n "$previous_upstream_ref" ] &&
+            previous_upstream_sha="$(git rev-parse --verify "${previous_upstream_ref}^{commit}" 2>/dev/null)" &&
+            git merge-base --is-ancestor "$previous_upstream_sha" "$upstream_sha"; then
+            upstream_titles="$(git log --reverse --format='- %s' "${previous_upstream_sha}..${upstream_sha}")"
+            if [ -n "$upstream_titles" ]; then
+              printf '\n%s\n' "$upstream_titles" >> "$commit_message"
+            fi
+          fi
+
+          if ! sh maint/scripts/apply-customizations.sh "$upstream_dir" >"$apply_log" 2>&1; then
+            customization_status="conflict"
+          fi
+
+          echo "customization_status=${customization_status}" >> "${GITHUB_OUTPUT}"
+
+          if [ "$customization_status" = "conflict" ]; then
+            cat "$apply_log" >&2
+            {
+              echo "## Upstream sync result"
+              echo
+              echo "- Status: conflict"
+              echo "- Upstream SHA: \`${upstream_sha}\`"
+              echo
+              echo "### Apply log"
+              echo '```text'
+              cat "$apply_log"
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+            echo "CUSTOMIZATION_STATUS=conflict"
+            exit 1
+          fi
+
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+
+          cp -R "$upstream_dir"/. .
+
+          git add -A
+          if workflow_writeback_has_staged_changes; then
+            git commit -F "$commit_message"
+            commit_sha="$(workflow_writeback_head_sha)"
+          fi
+
+          if [ -z "$commit_sha" ]; then
+            {
+              echo "## Upstream sync result"
+              echo
+              echo "- Status: no changes"
+              echo "- Upstream SHA: \`${upstream_sha}\`"
+              echo "- Target branch: \`${TARGET_BRANCH}\`"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          git push origin HEAD:${TARGET_BRANCH}
+
+          {
+            echo "## Upstream sync result"
+            echo
+            echo "- Status: pushed"
+            echo "- Upstream SHA: \`${upstream_sha}\`"
+            echo "- Target branch: \`${TARGET_BRANCH}\`"
+            echo "- Commit: \`${commit_sha}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Summarize failed result
+        if: failure() && steps.sync.outputs.customization_status != 'conflict'
+        run: |
+          {
+            echo "## Upstream sync result"
+            echo
+            echo "- Status: failed"
+            echo "- Target branch: \`${TARGET_BRANCH}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Delete Workflow Runs
+        if: always()
+        uses: ophub/delete-releases-workflows@main
+        with:
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          delete_releases: true
+          releases_keep_latest: 0
+          delete_tags: true
+          delete_workflows: true
+          workflows_keep_day: 0
