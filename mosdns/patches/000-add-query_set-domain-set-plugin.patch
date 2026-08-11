@@ -1,0 +1,545 @@
+From c4f86d365cead0f5e6d5457758816bc74243d86c Mon Sep 17 00:00:00 2001
+From: vitoegg <vitoegg@gmail.com>
+Date: Mon, 10 Aug 2026 13:01:59 +0800
+Subject: [PATCH] add query_set domain set plugin
+
+A domain set that grows by itself. `exec` records the domain of the
+current query, `matches: qname` tells whether a domain was recorded.
+The set is kept in memory and mirrored into a private file, so it
+survives a restart.
+
+- `file`: where the set is mirrored, created if it is missing
+- `max_entries`: max recorded domains (default 100000, max 100000)
+
+Signed-off-by: vitoegg <vitoegg@gmail.com>
+---
+ plugin/data_provider/query_set/query_set.go | 503 ++++++++++++++++++++
+ plugin/enabled_plugins_query_set.go         |   9 +
+ 2 files changed, 512 insertions(+)
+ create mode 100644 plugin/data_provider/query_set/query_set.go
+ create mode 100644 plugin/enabled_plugins_query_set.go
+
+diff --git a/plugin/data_provider/query_set/query_set.go b/plugin/data_provider/query_set/query_set.go
+new file mode 100644
+index 0000000..64461de
+--- /dev/null
++++ b/plugin/data_provider/query_set/query_set.go
+@@ -0,0 +1,503 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++package query_set
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"fmt"
++	"hash/maphash"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/IrineSistiana/mosdns/v5/coremain"
++	"github.com/IrineSistiana/mosdns/v5/pkg/concurrent_map"
++	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
++	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
++	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
++	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
++	"go.uber.org/zap"
++)
++
++const PluginType = "query_set"
++
++const (
++	// flushInterval is the interval of the background flush loop.
++	// Matching never reads the file, it is only written so the set
++	// survives a restart, so the interval is kept long to save the
++	// flash of a router.
++	flushInterval = time.Second * 30
++	// flushThreshold triggers an early flush if the pending buffer is
++	// big enough.
++	flushThreshold = 64 * 1024
++	// defaultMaxEntries is used when max_entries is not set.
++	defaultMaxEntries = 100000
++	// hardMaxEntries is the biggest max_entries that is accepted. It
++	// bounds the memory usage and the file size.
++	hardMaxEntries = 100000
++	// maxDomainLen is the maximum length of a domain name, without the
++	// root label.
++	maxDomainLen = 253
++
++	// fileHeader marks the file as owned by this plugin. The file is a
++	// mirror of the set in memory, one domain per line. It is not a
++	// domain_set file, and is not meant to be edited.
++	fileHeader = "# mosdns query_set, generated file, do not edit"
++
++	fileMode = 0644
++	dirMode  = 0755
++)
++
++func init() {
++	coremain.RegNewPluginFunc(PluginType, Init, func() any { return new(Args) })
++}
++
++type Args struct {
++	File string `yaml:"file"`
++	// MaxEntries is the maximum number of domains that are kept. It can
++	// not be bigger than hardMaxEntries. Zero means defaultMaxEntries.
++	MaxEntries int `yaml:"max_entries"`
++}
++
++func Init(bp *coremain.BP, args any) (any, error) {
++	return NewQuerySet(bp.L(), args.(*Args))
++}
++
++// fileReg keeps the files that are in use, so that a typo in the config
++// can not make two sets write to one file.
++var fileReg struct {
++	sync.Mutex
++	m map[string]struct{}
++}
++
++// domainKey is a key of the domain set. It is sharded by its hash, so
++// the query path is not a contention point.
++type domainKey string
++
++var domainKeySeed = maphash.MakeSeed()
++
++func (k domainKey) Sum() uint64 {
++	return maphash.String(domainKeySeed, string(k))
++}
++
++// domainSet is the set of the recorded domains. It only grows.
++type domainSet struct {
++	m *concurrent_map.Map[domainKey, struct{}]
++	n int
++}
++
++func newDomainSet() *domainSet {
++	return &domainSet{m: concurrent_map.NewMap[domainKey, struct{}]()}
++}
++
++func (s *domainSet) has(d string) bool {
++	_, ok := s.m.Get(domainKey(d))
++	return ok
++}
++
++// add reports whether d was absent, and has been added by this call.
++func (s *domainSet) add(d string) bool {
++	added := false
++	s.m.TestAndSet(domainKey(d), func(_ struct{}, ok bool) (struct{}, bool, bool) {
++		added = !ok
++		return struct{}{}, added, false
++	})
++	if added {
++		s.n++
++	}
++	return added
++}
++
++func (s *domainSet) len() int {
++	return s.n
++}
++
++func (s *domainSet) rangeDo(f func(d string)) {
++	_ = s.m.RangeDo(func(k domainKey, v struct{}) (struct{}, bool, bool, error) {
++		f(string(k))
++		return v, false, false, nil
++	})
++}
++
++var (
++	_ data_provider.DomainMatcherProvider = (*QuerySet)(nil)
++	_ domain.Matcher[struct{}]            = (*QuerySet)(nil)
++	_ sequence.Executable                 = (*QuerySet)(nil)
++)
++
++// QuerySet is a domain set that grows by itself. Executing it records
++// the domain of the current query, matching it tells whether a domain
++// has been recorded. Only the domain itself matches, its sub domains
++// are recorded on their own.
++//
++// The set in memory is the only source of truth. The file is a private
++// mirror of it, read once at startup, and rebuilt from memory if it is
++// removed or its size changes at runtime.
++type QuerySet struct {
++	file       string
++	maxEntries int
++	logger     *zap.Logger
++
++	// set is created at startup and is never replaced.
++	set *domainSet
++
++	mu       sync.Mutex // guards new entries, pending and full rebuilds
++	pending  []byte     // domains that are not written to the file yet
++	fileSize int64      // the file size after the last write
++
++	full        bool
++	closeOnce   sync.Once
++	closeNotify chan struct{}
++	flushSignal chan struct{}
++	flushDone   chan struct{}
++}
++
++// NewQuerySet creates the file if it does not exist, loads the domains
++// that are already in it, and starts the background flush loop.
++func NewQuerySet(logger *zap.Logger, args *Args) (*QuerySet, error) {
++	if logger == nil {
++		logger = zap.NewNop()
++	}
++	if len(strings.TrimSpace(args.File)) == 0 {
++		return nil, errors.New("missing file path")
++	}
++	file, err := filepath.Abs(strings.TrimSpace(args.File))
++	if err != nil {
++		return nil, fmt.Errorf("invalid file path, %w", err)
++	}
++
++	maxEntries := args.MaxEntries
++	switch {
++	case maxEntries == 0:
++		maxEntries = defaultMaxEntries
++	case maxEntries < 0 || maxEntries > hardMaxEntries:
++		return nil, fmt.Errorf("max_entries must be between 1 and %d, got %d", hardMaxEntries, maxEntries)
++	}
++
++	fileReg.Lock()
++	if _, dup := fileReg.m[file]; dup {
++		fileReg.Unlock()
++		return nil, fmt.Errorf("file %s is already used by another %s", file, PluginType)
++	}
++	if fileReg.m == nil {
++		fileReg.m = make(map[string]struct{})
++	}
++	fileReg.m[file] = struct{}{}
++	fileReg.Unlock()
++
++	if err := os.MkdirAll(filepath.Dir(file), dirMode); err != nil {
++		releaseFile(file)
++		return nil, fmt.Errorf("failed to create dir for %s, %w", file, err)
++	}
++	s := &QuerySet{
++		file:        file,
++		maxEntries:  maxEntries,
++		logger:      logger,
++		set:         newDomainSet(),
++		closeNotify: make(chan struct{}),
++		flushSignal: make(chan struct{}, 1),
++		flushDone:   make(chan struct{}),
++	}
++	if err := s.load(); err != nil {
++		releaseFile(file)
++		return nil, err
++	}
++	go s.flushLoop()
++	return s, nil
++}
++
++func releaseFile(file string) {
++	fileReg.Lock()
++	delete(fileReg.m, file)
++	fileReg.Unlock()
++}
++
++func (s *QuerySet) GetDomainMatcher() domain.Matcher[struct{}] {
++	return s
++}
++
++func (s *QuerySet) Match(d string) (struct{}, bool) {
++	return struct{}{}, s.set.has(domain.NormalizeDomain(d))
++}
++
++// Exec records the domain of the current query.
++func (s *QuerySet) Exec(_ context.Context, qCtx *query_context.Context) error {
++	s.add(qCtx.QQuestion().Name)
++	return nil
++}
++
++// Close stops the flush loop after writing the pending domains.
++func (s *QuerySet) Close() error {
++	s.closeOnce.Do(func() {
++		close(s.closeNotify)
++		<-s.flushDone
++		releaseFile(s.file)
++	})
++	return nil
++}
++
++// add records a domain if it is not in the set yet.
++func (s *QuerySet) add(fqdn string) {
++	d, ok := normalizeDomain(fqdn)
++	if !ok {
++		return
++	}
++	if s.set.has(d) {
++		return
++	}
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if s.set.len() >= s.maxEntries {
++		if s.set.has(d) {
++			return
++		}
++		s.warnFull()
++		return
++	}
++	// Only the query that puts the domain into the set writes it.
++	if !s.set.add(d) {
++		return
++	}
++
++	s.pending = append(s.pending, d...)
++	s.pending = append(s.pending, '\n')
++	pendingSize := len(s.pending)
++
++	if pendingSize >= flushThreshold {
++		select {
++		case s.flushSignal <- struct{}{}:
++		default:
++		}
++	}
++}
++
++func (s *QuerySet) warnFull() {
++	if !s.full {
++		s.full = true
++		s.logger.Warn(
++			"max_entries reached, the recorded domains still match but nothing new is recorded, "+
++				"raise max_entries or remove the file and restart",
++			zap.String("file", s.file),
++			zap.Int("max_entries", s.maxEntries),
++		)
++	}
++}
++
++func (s *QuerySet) flushLoop() {
++	defer close(s.flushDone)
++	ticker := time.NewTicker(flushInterval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ticker.C:
++			s.flush()
++		case <-s.flushSignal:
++			s.flush()
++		case <-s.closeNotify:
++			s.flush()
++			return
++		}
++	}
++}
++
++// flush appends the pending domains to the file. If the file is missing
++// or its size changed, it is rebuilt from the set in memory.
++func (s *QuerySet) flush() {
++	fi, err := os.Stat(s.file)
++	switch {
++	case err != nil && !os.IsNotExist(err):
++		s.logger.Warn("failed to stat file", zap.String("file", s.file), zap.Error(err))
++		return
++	case err != nil || fi.Size() != s.fileSize:
++		// The file was removed or its size changed. The set in memory is
++		// the source of truth, so write it out again.
++		if err := s.write(); err != nil {
++			s.logger.Error("failed to rebuild file", zap.String("file", s.file), zap.Error(err))
++		}
++		return
++	}
++
++	s.mu.Lock()
++	buf := s.pending
++	s.pending = nil
++	s.mu.Unlock()
++	if len(buf) == 0 {
++		return
++	}
++
++	if err := s.appendFile(buf); err != nil {
++		s.logger.Error("failed to write file", zap.String("file", s.file), zap.Error(err))
++		// Keep the domains, so the next flush can write them again.
++		s.mu.Lock()
++		s.pending = append(buf, s.pending...)
++		s.mu.Unlock()
++	}
++}
++
++// appendFile appends complete lines with one write.
++func (s *QuerySet) appendFile(b []byte) error {
++	f, err := os.OpenFile(s.file, os.O_WRONLY|os.O_APPEND, fileMode)
++	if err != nil {
++		return err
++	}
++	if _, err := f.Write(b); err != nil {
++		f.Close()
++		return err
++	}
++	if err := f.Close(); err != nil {
++		return err
++	}
++	s.fileSize += int64(len(b))
++	return nil
++}
++
++// write dumps the whole set into the file. The file is replaced by a
++// rename, so a reader never sees a partially rebuilt file.
++func (s *QuerySet) write() error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	// The pending domains are in the set already, this write covers them.
++	s.pending = nil
++
++	tmp := s.file + ".tmp"
++	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fileMode)
++	if err != nil {
++		return err
++	}
++	// bufio.Writer keeps the first write error, Flush reports it.
++	n := len(fileHeader) + 1
++	w := bufio.NewWriterSize(f, flushThreshold)
++	w.WriteString(fileHeader)
++	w.WriteByte('\n')
++	s.set.rangeDo(func(d string) {
++		w.WriteString(d)
++		w.WriteByte('\n')
++		n += len(d) + 1
++	})
++	err = w.Flush()
++	if closeErr := f.Close(); err == nil {
++		err = closeErr
++	}
++	if err == nil {
++		err = os.Rename(tmp, s.file)
++	}
++	if err != nil {
++		_ = os.Remove(tmp)
++		return err
++	}
++	s.fileSize = int64(n)
++	return nil
++}
++
++// load creates the file if it is missing, and fills the set from it.
++// A non-empty file must have the private header. Broken domain lines in
++// an owned file are skipped, then the file is rebuilt from valid entries.
++func (s *QuerySet) load() error {
++	f, err := os.OpenFile(s.file, os.O_RDONLY|os.O_CREATE, fileMode)
++	if err != nil {
++		return fmt.Errorf("failed to open %s, %w", s.file, err)
++	}
++	fi, err := f.Stat()
++	if err != nil {
++		f.Close()
++		return fmt.Errorf("failed to stat %s, %w", s.file, err)
++	}
++
++	clean := fi.Size() > 0
++	skipped := 0
++	scanner := bufio.NewScanner(f)
++	if clean {
++		if !scanner.Scan() {
++			err = scanner.Err()
++			f.Close()
++			if err != nil {
++				return fmt.Errorf("failed to read %s, %w", s.file, err)
++			}
++			return fmt.Errorf("missing %s file header in %s", PluginType, s.file)
++		}
++		if scanner.Text() != fileHeader {
++			f.Close()
++			return fmt.Errorf("invalid %s file header in %s", PluginType, s.file)
++		}
++		var last [1]byte
++		if _, err := f.ReadAt(last[:], fi.Size()-1); err != nil {
++			f.Close()
++			return fmt.Errorf("failed to read %s, %w", s.file, err)
++		}
++		clean = last[0] == '\n'
++	}
++	for scanner.Scan() {
++		line := strings.TrimSpace(scanner.Text())
++		if len(line) == 0 || line[0] == '#' {
++			continue
++		}
++		if s.set.len() >= s.maxEntries {
++			s.warnFull()
++			clean = false
++			break
++		}
++		d, ok := normalizeDomain(line)
++		if !ok {
++			skipped++
++			continue
++		}
++		if !s.set.add(d) || d != line {
++			clean = false // a duplicate, or a line that was not normalized
++		}
++	}
++	err = scanner.Err()
++	f.Close()
++	if err != nil {
++		return fmt.Errorf("failed to read %s, %w", s.file, err)
++	}
++	s.fileSize = fi.Size()
++
++	if skipped > 0 {
++		clean = false
++		s.logger.Warn(
++			"skipped broken lines",
++			zap.String("file", s.file),
++			zap.Int("count", skipped),
++		)
++	}
++	if !clean {
++		if err := s.write(); err != nil {
++			return fmt.Errorf("failed to write %s, %w", s.file, err)
++		}
++	}
++	return nil
++}
++
++// normalizeDomain converts a query name into a set entry. It reports
++// false if the name can not be used.
++func normalizeDomain(fqdn string) (string, bool) {
++	s := strings.TrimSuffix(fqdn, ".")
++	if len(s) == 0 || len(s) > maxDomainLen {
++		return "", false
++	}
++	hasUpper := false
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		switch {
++		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_':
++		case c >= 'A' && c <= 'Z':
++			hasUpper = true
++		case c == '.':
++			if i == 0 || i == len(s)-1 || s[i-1] == '.' { // no empty label
++				return "", false
++			}
++		default:
++			return "", false
++		}
++	}
++	if hasUpper {
++		s = strings.ToLower(s)
++	}
++	return s, true
++}
+diff --git a/plugin/enabled_plugins_query_set.go b/plugin/enabled_plugins_query_set.go
+new file mode 100644
+index 0000000..0d13e27
+--- /dev/null
++++ b/plugin/enabled_plugins_query_set.go
+@@ -0,0 +1,9 @@
++// SPDX-License-Identifier: GPL-3.0-only
++
++package plugin
++
++// Kept in its own file, so enabling this plugin does not touch
++// enabled_plugins.go.
++import (
++	_ "github.com/IrineSistiana/mosdns/v5/plugin/data_provider/query_set"
++)

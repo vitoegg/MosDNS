@@ -1,3 +1,6 @@
 README.md
 .github
 maint
+mosdns/patches/000-add-query_set-domain-set-plugin.patch
+luci-app-mosdns/root/etc/mosdns/rule/cloudflare-cidr.txt
+luci-app-mosdns/root/etc/mosdns/rule/local-ptr.txt

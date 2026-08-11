@@ -180,6 +180,7 @@ validate_luci_depends() {
 validate_mosdns_customizations() {
 	makefile="$TARGET_DIR/luci-app-mosdns/Makefile"
 	init_file="$TARGET_DIR/luci-app-mosdns/root/etc/init.d/mosdns"
+	uc_file="$TARGET_DIR/luci-app-mosdns/root/usr/share/mosdns/mosdns.uc"
 
 	[ -f "$makefile" ] || {
 		echo "Missing target file: luci-app-mosdns/Makefile" >&2
@@ -187,6 +188,10 @@ validate_mosdns_customizations() {
 	}
 	[ -f "$init_file" ] || {
 		echo "Missing target file: luci-app-mosdns/root/etc/init.d/mosdns" >&2
+		exit 1
+	}
+	[ -f "$uc_file" ] || {
+		echo "Missing target file: luci-app-mosdns/root/usr/share/mosdns/mosdns.uc" >&2
 		exit 1
 	}
 
@@ -199,6 +204,11 @@ validate_mosdns_customizations() {
 
 	require_absent "$init_file" 'CONF=$(uci -q get mosdns.config.configfile)' "top-level CONF uci call"
 	require_absent "$init_file" 'v2dat_dump' "v2dat_dump startup call"
+	# Match the call sites only: the '();' suffix keeps the still-present
+	# 'function update_geodat() {' / 'function v2dat_dump() {' definitions
+	# from tripping this, so a call re-added anywhere in mosdns.uc is caught.
+	require_absent "$uc_file" 'update_geodat();' "update_geodat call"
+	require_absent "$uc_file" 'v2dat_dump();' "v2dat_dump call"
 	require_single_occurrence "$init_file" 'config_get CONF $1 configfile "/var/etc/mosdns.json"' "runtime CONF config_get"
 
 	[ ! -e "$TARGET_DIR/v2dat" ] || {
@@ -206,6 +216,10 @@ validate_mosdns_customizations() {
 		exit 1
 	}
 
+	[ -f "$TARGET_DIR/mosdns/patches/000-add-query_set-domain-set-plugin.patch" ] || {
+		echo "Missing target file: mosdns/patches/000-add-query_set-domain-set-plugin.patch" >&2
+		exit 1
+	}
 }
 
 TARGET_DIR=""
