@@ -11,8 +11,11 @@ RESTORE_SKIP_PATHS="${RESTORE_SKIP_PATHS:-}"
 
 # Single source of truth for the LUCI_DEPENDS contract: geodata deps are
 # stripped from whatever upstream declares, the rest is passed through.
-GEODATA_DEPS='+v2ray-geoip +v2ray-geosite +v2dat'
-REQUIRED_DEPS='+mosdns +curl'
+# v2dat and geo2txt are both listed: upstream swapped the unpacker to geo2txt,
+# keeping the old name covers a revert without another edit here.
+GEODATA_DEPS='+v2ray-geoip +v2ray-geosite +v2dat +geo2txt'
+REQUIRED_DEPS='+mosdns +uclient-fetch'
+GEODATA_PKG_DIRS='v2dat geo2txt'
 
 usage() {
 	echo "Usage: sh maint/scripts/apply-customizations.sh <target-dir>" >&2
@@ -211,10 +214,12 @@ validate_mosdns_customizations() {
 	require_absent "$uc_file" 'v2dat_dump();' "v2dat_dump call"
 	require_single_occurrence "$init_file" 'config_get CONF $1 configfile "/var/etc/mosdns.json"' "runtime CONF config_get"
 
-	[ ! -e "$TARGET_DIR/v2dat" ] || {
-		echo "Unexpected path present: v2dat" >&2
-		exit 1
-	}
+	for pkg_dir in $GEODATA_PKG_DIRS; do
+		[ ! -e "$TARGET_DIR/$pkg_dir" ] || {
+			echo "Unexpected path present: $pkg_dir" >&2
+			exit 1
+		}
+	done
 
 	[ -f "$TARGET_DIR/mosdns/patches/000-add-query_set-domain-set-plugin.patch" ] || {
 		echo "Missing target file: mosdns/patches/000-add-query_set-domain-set-plugin.patch" >&2

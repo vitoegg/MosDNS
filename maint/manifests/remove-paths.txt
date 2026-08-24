@@ -1,5 +1,6 @@
 .github
 v2dat
+geo2txt
 install.sh
 README.md
 LICENSE
