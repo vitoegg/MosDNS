@@ -2,5 +2,6 @@ README.md
 .github
 maint
 mosdns/patches/000-add-query_set-domain-set-plugin.patch
+mosdns/patches/900-fix-negative-response-soa.patch
 luci-app-mosdns/root/etc/mosdns/rule/cloudflare-cidr.txt
 luci-app-mosdns/root/etc/mosdns/rule/local-ptr.txt

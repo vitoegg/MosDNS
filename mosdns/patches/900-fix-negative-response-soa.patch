@@ -1,0 +1,64 @@
+From 274337309083e0ced892aa4d0885c2dd6ed1b59d Mon Sep 17 00:00:00 2001
+From: vitoegg <vitoegg@gmail.com>
+Date: Wed, 9 Sep 2026 12:00:00 +0800
+Subject: [PATCH] fix negative response SOA owner and negative rejections
+
+GenEmptyReply had its question count test inverted, so every ordinary
+single-question empty reply carried an SOA owned by the root instead of
+the queried name. Use the question name whenever there is exactly one
+question.
+
+Attach the same synthetic SOA to the negative rejection codes NOERROR
+and NXDOMAIN, so clients can negatively cache a rejection for the SOA
+TTL instead of repeating the query. Error codes such as REFUSED and
+SERVFAIL are not negative responses and keep their bare reply.
+
+Signed-off-by: vitoegg <vitoegg@gmail.com>
+---
+ pkg/dnsutils/msg.go                    |  2 +-
+ plugin/executable/sequence/built_in.go | 12 +++++++++---
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/pkg/dnsutils/msg.go b/pkg/dnsutils/msg.go
+index b170cea..c69dc0a 100644
+--- a/pkg/dnsutils/msg.go
++++ b/pkg/dnsutils/msg.go
+@@ -131,7 +131,7 @@ func GenEmptyReply(q *dns.Msg, rcode int) *dns.Msg {
+ 	r.SetRcode(q, rcode)
+ 
+ 	var name string
+-	if len(q.Question) > 1 {
++	if len(q.Question) == 1 {
+ 		name = q.Question[0].Name
+ 	} else {
+ 		name = "."
+diff --git a/plugin/executable/sequence/built_in.go b/plugin/executable/sequence/built_in.go
+index f08cf2b..b9728d3 100644
+--- a/plugin/executable/sequence/built_in.go
++++ b/plugin/executable/sequence/built_in.go
+@@ -22,6 +22,7 @@ package sequence
+ import (
+ 	"context"
+ 	"fmt"
++	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
+ 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
+ 	"github.com/miekg/dns"
+ 	"strconv"
+@@ -46,9 +47,14 @@ type ActionReject struct {
+ }
+ 
+ func (a ActionReject) Exec(_ context.Context, qCtx *query_context.Context, _ ChainWalker) error {
+-	r := new(dns.Msg)
+-	r.SetReply(qCtx.Q())
+-	r.Rcode = a.Rcode
++	var r *dns.Msg
++	if a.Rcode == dns.RcodeSuccess || a.Rcode == dns.RcodeNameError {
++		r = dnsutils.GenEmptyReply(qCtx.Q(), a.Rcode)
++	} else {
++		r = new(dns.Msg)
++		r.SetReply(qCtx.Q())
++		r.Rcode = a.Rcode
++	}
+ 	qCtx.SetResponse(r)
+ 	return nil
+ }
